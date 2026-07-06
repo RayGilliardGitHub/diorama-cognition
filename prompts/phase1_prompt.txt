@@ -1,0 +1,127 @@
+# Phase 1: Single-Machine Prototype (4-node + Social Predictor)
+
+## Context
+
+Phase 0 (Modelfile standardization) and Phase 0.5 (Instrumentation) are already delivered.
+- 75 Modelfile variants exist at /home/rlg/modelfiles/ and are live in ollama
+- The instrumentation module is at /home/rlg/embodied-cognition/instrumentation.py
+- Read the plan at /home/rlg/Desktop/embodied-cognition-platform-plan.md for full architecture context
+
+## Goal
+
+Build a working 4-node proof of concept that validates the core loop: multiple specialized model instances, each with a distinct role, feeding into a Synthesizer ("I AM"). Wrap every ollama call with the TurnLogger from Phase 0.5 so every turn produces a structured JSONL record.
+
+This is the gate for the entire project: if this prototype's output is indistinguishable from a single model running alone (measured by blind A/B comparison), we stop here.
+
+## Architecture (5 nodes, single machine, no MQ bus yet)
+
+All nodes run sequentially via direct Python subprocess or ollama Python library on one machine. The instrumentation module wraps every call.
+
+### Node A: Sensory (Edge/Pattern Detector)
+- Model: `llama3.2:1b-focus`
+- System prompt (max 50 lines): processes input objectively, describes what is being perceived without interpretation
+- Purpose: detects patterns in the raw user message — facts, entities, structure
+- Output: a concise factual description of the input's content
+
+### Node B: Emotional Valuator
+- Model: `qwen2.5:7b-creative`
+- System prompt (max 50 lines): assigns emotional weight, evaluates valence and arousal
+- Purpose: colors the input with emotional significance
+- Output: a short emotional assessment (valence, arousal, emotional tone)
+
+### Node C: Episodic Retriever (Memory)
+- Model: `lfm2.5:8b-std` (or `lfm2.5:8b` if -std variant wasn't created — check with `ollama list` first)
+- System prompt (max 50 lines): recalls patterns and relevant context from conversation history
+- Purpose: brings prior context into the current turn (short-term memory via accumulated messages, NOT a vector DB)
+- Output: relevant context from previous turns, or "No prior context" on first turn
+
+### Node D: Social Predictor (Theory of Mind)
+- Model: `lfm2.5:8b-creative`
+- System prompt (max 50 lines): predicts what the interlocutor expects. Must explicitly model: authority, relationship, gender, social script
+- Purpose: generates a social-context prediction that the Synthesizer can follow or resist
+- Output: "Expectation: ... Social script: ... Internal conflict: ..."
+
+### Node E: Synthesizer ("I AM")
+- Model: `lfm2.5:8b-bal` (or the closest -bal variant available)
+- System prompt (max 50 lines): receives ALL node outputs, binds them into a single coherent response. Must also output a chemistry adjustment as a JSON line at the end: `{"chemistry_adjustment": {"adrenaline": -0.1, ...}, "weighting": {"sensory": 0.2, ...}}`
+- Purpose: the final binding — this is where uniqueness emerges
+
+## Implementation Spec
+
+Build /home/rlg/embodied-cognition/phase1.py as a single self-contained script (~200-250 lines):
+
+### Requirements
+
+1. **CLI interface:**
+   ```
+   python3 phase1.py [--turns N] [--disable <node> [--disable <node> ...]] [--log LOGFILE]
+   ```
+   Default: --turns 3, log to phase1_log.jsonl in current directory
+
+2. **Turn loop:**
+   - Each turn reads a user message (from stdin, one per line, or use built-in test prompts if stdin is a TTY)
+   - For each enabled node, call `ollama run <model>` via subprocess (or the ollama Python library)
+   - Time each call with time.perf_counter()
+   - Log each node via TurnLogger.log_node()
+   - Pass all enabled nodes' outputs into the Synthesizer's prompt
+   - Parse the Synthesizer's JSON suffix for chemistry_adjustment and weighting
+   - Call TurnLogger.finish() with the parsed values
+   - Print the Synthesizer's response text
+
+3. **System prompt injection pattern:**
+   Each node gets its own system prompt. The format for ollama run is:
+   ```
+   ollama run <model> "<system_prompt> User: <user_message> AI:"
+   ```
+   OR use the ollama Python library's chat API with messages=[{"role": "system", "content": ...}, {"role": "user", "content": ...}]
+
+4. **Use the Phase 0.5 instrumentation module:**
+   ```python
+   from instrumentation import TurnLogger, DEFAULT_CHEMISTRY, PRIMARY_NODES
+   ```
+   Wrap each turn in a `with TurnLogger(...) as log:` block.
+
+5. **Ablation support:**
+   `--disable sensory` removes that node entirely — its output is replaced with "Node disabled. No signal." and it gets zero weight in the synthesizer's context.
+
+6. **Error handling:**
+   - If a node call times out or errors, log it as `"output": "(node_error: ...)"` with latency_ms=0 and continue
+   - Never crash on a single node failure
+
+### Built-in test prompts (used when stdin is a TTY):
+1. "What time is it?"
+2. "I just got some bad news at work."
+3. "I need to make a decision about a job offer."
+4. "Tell me about yourself."
+5. "You're talking to your boss, not a friend. Respond accordingly."
+
+### Conversation memory:
+For the Episodic Retriever, maintain a simple list of past turns (user message + synthesizer response) as conversation history. Pass the last 2 turns as context. Do NOT use a vector DB.
+
+## Test Criteria to Run
+
+After building phase1.py, run it with the default 3 turns and check:
+
+1. **Execution:** script runs end-to-end without errors
+2. **JSONL output:** open the log file, verify each record has 5 nodes (or fewer if --disable used) + synthesizer + full chemistry
+3. **Social context modulation:** Run twice with --turns 1, once with the "boss" prompt and once with the "friend" prompt. Compare the synthesizer outputs — the boss response should be measurably more deferential/formal
+
+Then run the **Synthesizer Dominance Test (A/B):**
+```
+python3 phase1.py --turns 50
+```
+This runs 50 prompts through the full architecture. The raw JSONL log is the output. We'll do the blind comparison manually later — the important thing is that it produces 50 clean turns without errors.
+
+## Deliverables
+
+- /home/rlg/embodied-cognition/phase1.py — the working prototype
+- /home/rlg/embodied-cognition/phase1_log.jsonl — a 3-turn example run (generated during testing)
+- A printout showing that the script ran successfully with its output
+
+## Prompt Inflation Guardrail
+
+Every node's system prompt MUST fit in 50 lines maximum. Hard limit. If a prompt needs more than 50 lines, the node is poorly defined — the prompt has become the architecture.
+
+## True North
+
+This script either produces behavior that a blind judge can distinguish from a single model running alone, or it doesn't. Either outcome is valuable. Do NOT over-engineer the prompts trying to force emergence — write clear, minimal system prompts and let the architecture speak.

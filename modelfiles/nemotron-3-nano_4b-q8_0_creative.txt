@@ -1,0 +1,5 @@
+FROM nemotron-3-nano:4b-q8_0
+PARAMETER temperature 0.8
+PARAMETER top_p 0.98
+PARAMETER top_k 80
+PARAMETER repeat_penalty 1.05
